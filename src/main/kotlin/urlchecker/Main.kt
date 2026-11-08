@@ -2,18 +2,24 @@ package urlchecker
 
 import java.io.File
 import java.net.URI
+import java.util.Locale
+import kotlin.system.exitProcess
 
 const val VERSION = "1.1.0"
 
 fun main(args: Array<String>) {
+    exitProcess(run(args))
+}
+
+internal fun run(args: Array<String>): Int {
     if (args.isEmpty()) {
         printUsage()
-        return
+        return 0
     }
 
     if (args.contains("--version")) {
         println("UrlChecker $VERSION")
-        return
+        return 0
     }
 
     val urls = mutableListOf<String>()
@@ -34,37 +40,62 @@ fun main(args: Array<String>) {
             "--verbose", "-v" -> verbose = true
             "--method", "-m" -> {
                 if (i + 1 < args.size) {
-                    method = args[i + 1].uppercase()
+                    method = args[i + 1].uppercase(Locale.ROOT)
                     i++
+                } else {
+                    println("Error: --method requires a value")
+                    return 2
                 }
             }
             "--data", "-d" -> {
                 if (i + 1 < args.size) {
                     requestBody = args[i + 1]
                     i++
+                } else {
+                    println("Error: --data requires a value")
+                    return 2
                 }
             }
             "--output", "-o" -> {
                 if (i + 1 < args.size) {
                     outputFile = args[i + 1]
                     i++
+                } else {
+                    println("Error: --output requires a file path")
+                    return 2
                 }
             }
             "--batch", "-b" -> {
                 if (i + 1 < args.size) {
                     batchFile = args[i + 1]
                     i++
+                } else {
+                    println("Error: --batch requires a file path")
+                    return 2
                 }
             }
             "--timeout" -> {
                 if (i + 1 < args.size) {
-                    timeout = args[i + 1].toLongOrNull() ?: 30L
+                    timeout = args[i + 1].toLongOrNull() ?: run {
+                        System.err.println("Error: Timeout must be an integer between 1 and 3600")
+                        return 2
+                    }
                     i++
+                    if (timeout !in 1..3600) {
+                        System.err.println("Error: Timeout must be between 1 and 3600 seconds")
+                        return 2
+                    }
+                } else {
+                    println("Error: --timeout requires a value")
+                    return 2
                 }
             }
             else -> {
                 if (!args[i].startsWith("-")) {
                     urls.add(args[i])
+                } else {
+                    println("Error: Unknown option '${args[i]}'")
+                    return 2
                 }
             }
         }
@@ -75,7 +106,7 @@ fun main(args: Array<String>) {
         val file = File(batchFile)
         if (!file.exists()) {
             println("Error: Batch file not found: $batchFile")
-            return
+            return 2
         }
         file.readLines().forEach { line ->
             val trimmed = line.trim()
@@ -88,57 +119,77 @@ fun main(args: Array<String>) {
     if (urls.isEmpty()) {
         println("Error: No URLs provided.")
         printUsage()
-        return
+        return 2
     }
 
     val checker = UrlChecker(timeout)
-    val results = mutableListOf<String>()
+    val renderedResults = mutableListOf<String>()
+    val jsonResults = mutableListOf<String>()
+    var hadErrors = false
     val validMethods = listOf("GET", "POST", "PUT", "DELETE", "HEAD", "PATCH")
 
     if (!validMethods.contains(method)) {
-        println("Error: Unsupported method '$method'. Supported: ${validMethods.joinToString(", ")}")
-        return
+        System.err.println("Error: Unsupported method '$method'. Supported: ${validMethods.joinToString(", ")}")
+        return 2
     }
 
     urls.forEach { url ->
         if (!isValidUrl(url)) {
             val error = "Error: Invalid URL: $url"
-            println(error)
-            results.add(error)
+            hadErrors = true
+            System.err.println(error)
+            if (showJson) jsonResults.add(printJsonError(url, "Invalid URL"))
+            else renderedResults.add(error)
             return@forEach
         }
 
         if (verbose) {
-            println("${BLUE}Checking: $url${RESET}")
+            System.err.println("${BLUE}Checking: $url${RESET}")
         }
 
         val result = checker.check(url, method, requestBody)
 
         result.onSuccess { metadata ->
-            val output = if (showJson) {
-                printJson(metadata)
+            if (showJson) {
+                jsonResults.add(printJson(metadata))
             } else {
-                printDefault(metadata, verbose) + if (showHeaders) printHeaders(metadata) else ""
+                val output = printDefault(metadata, verbose) + if (showHeaders) printHeaders(metadata) else ""
+                renderedResults.add(output)
             }
-            println(output)
-            results.add(output)
         }.onFailure { error ->
+            hadErrors = true
             val errorMsg = "Error: ${error.message}"
-            println(errorMsg)
-            results.add(errorMsg)
+            System.err.println(errorMsg)
+            if (showJson) jsonResults.add(printJsonError(url, error.message ?: "Unknown error"))
+            else renderedResults.add(errorMsg)
         }
     }
 
-    outputFile?.let { path ->
-        File(path).writeText(results.joinToString("\n"))
-        println("\n${GREEN}Results saved to: $path${RESET}")
+    val output = if (showJson) {
+        if (jsonResults.size == 1) jsonResults.single() else "[${jsonResults.joinToString(",")}]"
+    } else {
+        renderedResults.joinToString("\n")
     }
+
+    outputFile?.let { path ->
+        runCatching { File(path).writeText(output) }
+            .onFailure {
+                System.err.println("Error: Could not write output file '$path': ${it.message}")
+                return 2
+            }
+        System.err.println("${GREEN}Results saved to: $path${RESET}")
+    }
+    if (outputFile == null && output.isNotEmpty()) {
+        println(output)
+    }
+    return if (hadErrors) 1 else 0
 }
 
 internal fun isValidUrl(url: String): Boolean {
     return try {
         val uri = URI.create(url)
-        uri.scheme != null && uri.host != null
+        uri.scheme != null && uri.scheme.lowercase(Locale.ROOT) in setOf("http", "https") &&
+            !uri.host.isNullOrBlank() && uri.userInfo == null && uri.fragment == null
     } catch (_: Exception) {
         false
     }
@@ -213,8 +264,25 @@ private fun printHeaders(metadata: UrlMetadata): String {
     return sb.toString()
 }
 
-private fun String.toJsonString(): String =
-    replace("\\", "\\\\").replace("\"", "\\\"")
+private fun String.toJsonString(): String = buildString {
+    for (character in this@toJsonString) {
+        when (character) {
+            '\\' -> append("\\\\")
+            '"' -> append("\\\"")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            '\t' -> append("\\t")
+            '\b' -> append("\\b")
+            '\u000C' -> append("\\f")
+            else -> if (character.code < 0x20) append("\\u%04x".format(character.code)) else append(character)
+        }
+    }
+}
+
+internal fun printJsonForTest(metadata: UrlMetadata): String = printJson(metadata)
+
+private fun printJsonError(url: String, message: String): String =
+    "{\"url\":\"${url.toJsonString()}\",\"error\":\"${message.toJsonString()}\"}"
 
 private fun printJson(metadata: UrlMetadata): String {
     val json = buildString {
@@ -259,8 +327,8 @@ private fun printUsage() {
           --headers          Show HTTP response headers
           --json             Output as JSON
           --timeout <secs>   Set connection timeout in seconds (default: 30)
-          --method, -m       HTTP method: GET, POST, PUT, DELETE, HEAD (default: GET)
-          --data, -d         Request body for POST/PUT
+          --method, -m       HTTP method: GET, POST, PUT, DELETE, HEAD, PATCH (default: GET)
+          --data, -d         Request body for POST/PUT/PATCH
           --output, -o       Save results to file
           --batch, -b        Check URLs from file (one per line)
           --verbose, -v      Show detailed output

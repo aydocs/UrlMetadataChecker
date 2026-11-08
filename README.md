@@ -41,7 +41,7 @@ Valid To      : Wed Oct 28 01:17:21 TRT 2026
 
 ## Features
 
-- HTTP/HTTPS metadata check (GET, POST, PUT, DELETE, HEAD)
+- HTTP/HTTPS metadata check (GET, POST, PUT, DELETE, HEAD, PATCH)
 - Status code, response time, content type, server, title
 - DNS lookup time
 - Response body size
@@ -56,13 +56,14 @@ Valid To      : Wed Oct 28 01:17:21 TRT 2026
 - `--output` — save results to file
 - `--batch` — check multiple URLs from file
 - `--timeout` — custom connection timeout
+- Response body limit (10 MiB by default) to prevent unbounded memory use
 - Graceful error handling
 
 ## Requirements
 
 - **JDK 17** or newer
-- **Kotlin 1.9+**
-- **Gradle** (wrapper included)
+- **Kotlin 1.9+** (compiler is provided by the Gradle build)
+- **Gradle 8.5** (wrapper included; a separate Gradle installation is not required)
 
 ## Quick Start
 
@@ -70,7 +71,12 @@ Valid To      : Wed Oct 28 01:17:21 TRT 2026
 git clone https://github.com/aydocs/UrlMetadataChecker.git
 cd UrlMetadataChecker
 ./gradlew build
+./gradlew installDist
 ```
+
+The installed executable is `build/install/urlchecker/bin/urlchecker`.
+Use that executable when consuming `--json` from a script; `./gradlew run`
+also prints Gradle task logs.
 
 ## Usage
 
@@ -97,6 +103,10 @@ cd UrlMetadataChecker
 ./gradlew run --args="--batch urls.txt"
 ```
 
+When `--json` is used, a single URL produces one JSON object. Multiple URLs
+produce a JSON array. Progress and error messages are written to stderr so
+stdout remains machine-readable.
+
 ## Options
 
 | Option | Description |
@@ -105,8 +115,8 @@ cd UrlMetadataChecker
 | `--headers` | Display all HTTP response headers |
 | `--json` | Output result as JSON |
 | `--verbose, -v` | Detailed output |
-| `--method, -m` | HTTP method: GET, POST, PUT, DELETE, HEAD |
-| `--data, -d` | Request body for POST/PUT |
+| `--method, -m` | HTTP method: GET, POST, PUT, DELETE, HEAD, PATCH |
+| `--data, -d` | Request body for POST/PUT/PATCH |
 | `--output, -o` | Save results to file |
 | `--batch, -b` | Check URLs from file (one per line) |
 | `--timeout <s>` | Connection timeout in seconds (default: 30) |
@@ -139,6 +149,25 @@ src/
 ```bash
 ./gradlew test
 ```
+
+The HTTP integration tests use a local in-process server and do not require
+internet access.
+
+The tool accepts only `http` and `https` URLs. Credentials and URL fragments
+are rejected so they are not accidentally sent or exposed in output. A request
+timeout is limited to 1 hour and response bodies are capped at 10 MiB by
+default.
+
+Exit codes are `0` for successful checks, `1` when at least one URL could not
+be checked, and `2` for invalid command-line input. With `--json`, results are
+written to stdout and progress/errors are written to stderr.
+
+## Security model
+
+UrlChecker is a local CLI tool. It makes outbound HTTP(S) requests to the
+URLs supplied by the operator and follows up to 10 redirects. It is not
+designed to be exposed as an unauthenticated network service. Responses are
+limited to 10 MiB by default.
 
 ## License
 

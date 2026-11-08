@@ -2,6 +2,7 @@ package urlchecker
 
 import java.net.ConnectException
 import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
 import java.net.URI
 import java.net.UnknownHostException
@@ -10,19 +11,44 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.security.cert.X509Certificate
 import java.time.Duration
+import java.io.InputStream
+import java.util.Locale
 import javax.net.ssl.SSLSession
 import javax.net.ssl.SSLSocketFactory
 
-class UrlChecker(private val timeoutSeconds: Long = 30) {
+class UrlChecker(
+    private val timeoutSeconds: Long = 30,
+    private val maxResponseBytes: Int = DEFAULT_MAX_RESPONSE_BYTES
+) {
+
+    init {
+        require(timeoutSeconds in 1..MAX_TIMEOUT_SECONDS) {
+            "Timeout must be between 1 and $MAX_TIMEOUT_SECONDS seconds"
+        }
+        require(maxResponseBytes in 1 until Int.MAX_VALUE) { "Maximum response size must be positive" }
+    }
 
     fun check(url: String, method: String = "GET", requestBody: String? = null): Result<UrlMetadata> {
         return runCatching {
             val startDns = System.nanoTime()
-            val host = URI.create(url).host
+            val parsedUrl = URI.create(url)
+            require(parsedUrl.scheme.lowercase() in setOf("http", "https") && !parsedUrl.host.isNullOrBlank()) {
+                "Invalid URL."
+            }
+            require(parsedUrl.userInfo == null && parsedUrl.fragment == null) {
+                "URL must not contain credentials or a fragment."
+            }
+            val normalizedMethod = method.uppercase(Locale.ROOT)
+            require(normalizedMethod in SUPPORTED_METHODS) {
+                "Unsupported method '$method'. Supported: ${SUPPORTED_METHODS.joinToString(", ")}"
+            }
+            val host = parsedUrl.host
             InetAddress.getByName(host)
             val dnsTime = (System.nanoTime() - startDns) / 1_000_000
 
-            val sslInfo = if (url.startsWith("https")) fetchSslInfo(host) else null
+            val sslInfo = if (parsedUrl.scheme.equals("https", ignoreCase = true)) {
+                fetchSslInfo(host, parsedUrl.port)
+            } else null
 
             val client = HttpClient.newBuilder()
                 .followRedirects(HttpClient.Redirect.NEVER)
@@ -34,7 +60,7 @@ class UrlChecker(private val timeoutSeconds: Long = 30) {
                 .timeout(Duration.ofSeconds(timeoutSeconds))
                 .header("User-Agent", "UrlChecker/1.0")
 
-            val request = when (method.uppercase()) {
+            val request = when (normalizedMethod) {
                 "POST" -> {
                     builder.POST(HttpRequest.BodyPublishers.ofString(requestBody ?: ""))
                 }
@@ -47,46 +73,61 @@ class UrlChecker(private val timeoutSeconds: Long = 30) {
                 "HEAD" -> {
                     builder.method("HEAD", HttpRequest.BodyPublishers.noBody())
                 }
+                "PATCH" -> {
+                    builder.method("PATCH", HttpRequest.BodyPublishers.ofString(requestBody ?: ""))
+                }
                 else -> builder.GET()
             }.build()
 
-            val startTime = System.currentTimeMillis()
-            val response = client.send(request, HttpResponse.BodyHandlers.ofString())
-            val elapsed = System.currentTimeMillis() - startTime
-
-        val contentType = response.headers().firstValue("Content-Type").orElse("Unknown")
-        val server = response.headers().firstValue("Server").orElse("Unknown")
-
-        val headers = mutableMapOf<String, String>()
-            response.headers().map().forEach { (name, values) ->
-                headers[name] = values.joinToString(", ")
-            }
+            val startTime = System.nanoTime()
+            val response = client.send(request, HttpResponse.BodyHandlers.ofInputStream())
 
             val redirectChain = mutableListOf<String>()
             var currentResponse = response
             var currentUrl = url
             var statusCode = response.statusCode()
 
-            while (statusCode in 301..308 || statusCode == 307 || statusCode == 308) {
+            var redirectCount = 0
+            while (statusCode in setOf(301, 302, 303, 307, 308) && redirectCount < MAX_REDIRECTS) {
                 val location = currentResponse.headers().firstValue("Location").orElse(null)
                 if (location == null) break
                 redirectChain.add(currentResponse.request().uri().toString())
-                currentUrl = if (location.startsWith("http")) location else URI.create(currentUrl).resolve(location).toString()
-                val nextRequest = HttpRequest.newBuilder()
+                val resolvedUrl = URI.create(currentUrl).resolve(location)
+                require(resolvedUrl.scheme.lowercase() in setOf("http", "https") && !resolvedUrl.host.isNullOrBlank()) {
+                    "Invalid redirect URL."
+                }
+                require(resolvedUrl.userInfo == null && resolvedUrl.fragment == null) {
+                    "Redirect URL must not contain credentials or a fragment."
+                }
+                currentUrl = resolvedUrl.toString()
+                currentResponse.body().close()
+                val redirectMethod = if (statusCode == 307 || statusCode == 308) normalizedMethod else "GET"
+                val nextBuilder = HttpRequest.newBuilder()
                     .uri(URI.create(currentUrl))
                     .timeout(Duration.ofSeconds(timeoutSeconds))
                     .header("User-Agent", "UrlChecker/1.0")
-                    .GET()
-                    .build()
-                currentResponse = client.send(nextRequest, HttpResponse.BodyHandlers.ofString())
+                val nextRequest = when (redirectMethod) {
+                    "POST" -> nextBuilder.POST(HttpRequest.BodyPublishers.ofString(requestBody ?: ""))
+                    "PUT" -> nextBuilder.PUT(HttpRequest.BodyPublishers.ofString(requestBody ?: ""))
+                    "DELETE" -> nextBuilder.DELETE()
+                    "HEAD" -> nextBuilder.method("HEAD", HttpRequest.BodyPublishers.noBody())
+                    "PATCH" -> nextBuilder.method("PATCH", HttpRequest.BodyPublishers.ofString(requestBody ?: ""))
+                    else -> nextBuilder.GET()
+                }.build()
+                currentResponse = client.send(nextRequest, HttpResponse.BodyHandlers.ofInputStream())
                 statusCode = currentResponse.statusCode()
+                redirectCount++
             }
 
             val finalResponse = if (redirectChain.isEmpty()) response else currentResponse
             val finalStatusCode = if (redirectChain.isEmpty()) response.statusCode() else statusCode
 
-            val title = if (contentType.contains("text/html")) {
-                HtmlParser.extractTitle(finalResponse.body())
+            val finalContentType = finalResponse.headers().firstValue("Content-Type").orElse("Unknown")
+            val finalServer = finalResponse.headers().firstValue("Server").orElse("Unknown")
+            val finalHeaders = finalResponse.headers().map().mapValues { (_, values) -> values.joinToString(", ") }
+            val finalBody = readBody(finalResponse)
+            val title = if (finalContentType.contains("text/html", ignoreCase = true)) {
+                HtmlParser.extractTitle(finalBody.text)
             } else {
                 "Not found"
             }
@@ -97,20 +138,20 @@ class UrlChecker(private val timeoutSeconds: Long = 30) {
                 url = finalResponse.request().uri().toString(),
                 statusCode = finalStatusCode,
                 status = statusMessage,
-                responseTimeMs = elapsed,
-                contentType = contentType,
-                server = server,
+                responseTimeMs = (System.nanoTime() - startTime) / 1_000_000,
+                contentType = finalContentType,
+                server = finalServer,
                 title = title,
-                headers = headers,
+                headers = finalHeaders,
                 redirectChain = redirectChain,
-                bodySizeBytes = finalResponse.body().toByteArray().size.toLong(),
+                bodySizeBytes = finalBody.sizeBytes,
                 dnsLookupTimeMs = dnsTime,
                 tlsVersion = sslInfo?.tlsVersion,
                 certSubject = sslInfo?.certSubject,
                 certIssuer = sslInfo?.certIssuer,
                 certValidFrom = sslInfo?.certValidFrom,
                 certValidTo = sslInfo?.certValidTo,
-                method = method.uppercase()
+                method = normalizedMethod
             )
         }.recoverCatching { e ->
             throw when (e) {
@@ -118,28 +159,45 @@ class UrlChecker(private val timeoutSeconds: Long = 30) {
                 is SocketTimeoutException -> Exception("Connection timed out")
                 is ConnectException -> Exception("Connection refused")
                 is javax.net.ssl.SSLException -> Exception("SSL error")
+                is InterruptedException -> {
+                    Thread.currentThread().interrupt()
+                    Exception("Request interrupted")
+                }
+                is ResponseTooLargeException -> Exception(e.message)
                 is IllegalArgumentException -> Exception("Invalid URL.")
                 else -> Exception("Failed: ${e.message}")
             }
         }
     }
 
-    private fun fetchSslInfo(host: String): SslInfo? {
+    private fun readBody(response: HttpResponse<InputStream>): BodyRead {
+        response.body().use { input ->
+            val bytes = input.readNBytes(maxResponseBytes + 1)
+            if (bytes.size > maxResponseBytes) {
+                throw ResponseTooLargeException("Response body exceeds ${maxResponseBytes} bytes")
+            }
+            return BodyRead(bytes.toString(Charsets.UTF_8), bytes.size.toLong())
+        }
+    }
+
+    private fun fetchSslInfo(host: String, port: Int): SslInfo? {
         return try {
             val factory = SSLSocketFactory.getDefault()
-            val socket = factory.createSocket(host, 443) as javax.net.ssl.SSLSocket
-            socket.startHandshake()
-            val session: SSLSession = socket.session
-            val certs = session.peerCertificates
-            val cert = certs.firstOrNull() as? X509Certificate
-            socket.close()
-            SslInfo(
-                tlsVersion = session.protocol,
-                certSubject = cert?.subjectX500Principal?.getName(),
-                certIssuer = cert?.issuerX500Principal?.getName(),
-                certValidFrom = cert?.notBefore?.toString(),
-                certValidTo = cert?.notAfter?.toString()
-            )
+            (factory.createSocket() as javax.net.ssl.SSLSocket).use { socket ->
+                socket.connect(InetSocketAddress(host, if (port > 0) port else 443), (timeoutSeconds * 1_000).toInt())
+                socket.soTimeout = (timeoutSeconds * 1_000).toInt()
+                socket.startHandshake()
+                val session: SSLSession = socket.session
+                val certs = session.peerCertificates
+                val cert = certs.firstOrNull() as? X509Certificate
+                SslInfo(
+                    tlsVersion = session.protocol,
+                    certSubject = cert?.subjectX500Principal?.getName(),
+                    certIssuer = cert?.issuerX500Principal?.getName(),
+                    certValidFrom = cert?.notBefore?.toString(),
+                    certValidTo = cert?.notAfter?.toString()
+                )
+            }
         } catch (_: Exception) {
             null
         }
@@ -175,4 +233,15 @@ class UrlChecker(private val timeoutSeconds: Long = 30) {
         val certValidFrom: String?,
         val certValidTo: String?
     )
+
+    private class ResponseTooLargeException(message: String) : Exception(message)
+
+    private data class BodyRead(val text: String, val sizeBytes: Long)
+
+    private companion object {
+        const val MAX_REDIRECTS = 10
+        const val MAX_TIMEOUT_SECONDS = 3600L
+        const val DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+        val SUPPORTED_METHODS = setOf("GET", "POST", "PUT", "DELETE", "HEAD", "PATCH")
+    }
 }
